@@ -5,27 +5,38 @@
 #include <Adafruit_SI1145.h>
 #include <HTU21D.h>
 
-#define kLoopInterval 1
-#define kBarDisplayFrequency 6
-#define kMatrixRotation 3
+#define kLoopInterval             1
+#define kBarDisplayFrequency      6
+#define kMatrixRotation           3
+#define kTemperatureLowerLimit    20.0f
+#define kTemperatureUpperLimit    26.0f
+#define kTemperatureRange         ( kTemperatureUpperLimit - kTemperatureLowerLimit )
+#define kMoleculeMultiplier       100
+
+#define COUNT(b) (int)(sizeof(b) / sizeof(b[0]))
+
 
 // SENSORS
 Adafruit_BicolorMatrix matrix1 = Adafruit_BicolorMatrix();
 Adafruit_BicolorMatrix matrix2 = Adafruit_BicolorMatrix();
+Adafruit_SI1145 uvSensor       = Adafruit_SI1145();
 Adafruit_MPL115A2 barometerSensor;
-Adafruit_SI1145 uvSensor = Adafruit_SI1145();
 HTU21D humiditySensor;
 
 // VARIABLES
-float   pressure                 = 0,
-        temperature              = 0,
-        humidity                 = 0,
-        light                    = 0,
-        uv                       = 0,
-        ir                       = 0;
-uint8_t periodCounter            = 0;
-int8_t  moleculePositions[2][2]  = { { 2, 2 }, { 6, 6 } },
-        moleculeDirections[2][2] = { { 1, 1 }, { -1, -1 } };
+float    _pressure                 = 0,
+         _temperature              = 0,
+         _humidity                 = 0,
+         _light                    = 0,
+         _uv                       = 0,
+         _ir                       = 0,
+         _temperatureBuffer[100];
+uint8_t  _periodCounter            = 0;
+uint16_t _sensorCounter            = 0,
+         _sensorMaxCounter;
+int8_t   _moleculePositions[3][2]  = { { 2, 2 }, { 6, 6 }, { 4, 4 } },
+         _moleculeDirections[3][2] = { { 1, 1 }, { -1, -1 }, { 1, -1 } },
+         _moleculeModuli[3]        = { kMoleculeMultiplier, kMoleculeMultiplier, kMoleculeMultiplier };
 
 
 void numberBarDisplay( Adafruit_BicolorMatrix &matrix, int numeral, int16_t offset, uint16_t colour )
@@ -44,11 +55,15 @@ void moleculeMotionDisplay( Adafruit_BicolorMatrix &matrix, int8_t *position, in
 
 	if ( randoms[0] > 87 && direction[0] != 0 ) direction[0] = 0;
 	else if ( randoms[0] > 75 ) direction[0] = -direction[0];
-	else if ( randoms[0] < 25 && direction[0] == 0 ) direction[0] = randoms[0] % 2 == 0 ? 1 : -1;
+	else if ( randoms[0] < 15 && direction[0] == 0 ) direction[0] = randoms[0] % 2 == 0 ? 1 : -1;
 	if ( randoms[1] > 87 && direction[1] != 0 ) direction[1] = 0;
 	else if ( randoms[1] > 75 ) direction[1] = -direction[1];
-	else if ( randoms[1] < 25 && direction[1] == 0 ) direction[1] = randoms[1] % 2 == 0 ? 1 : -1;
+	else if ( randoms[1] < 15 && direction[1] == 0 ) direction[1] = randoms[1] % 2 == 0 ? 1 : -1;
 
+	// don't let molecules be still
+	if ( direction[0] == 0 && direction[1] == 0 ) direction[ randoms[0] % 2 ] = randoms[1] % 2 == 0 ? 1 : -1;
+
+	// check molecule isn't going off the edge
 	if ( position[0] >= 7 && direction[0] == 1 ) direction[0] = -1;
 	else if ( position[0] <= 0 && direction[0] == -1 ) direction[0] = 1;
 	if ( position[1] >= 7 && direction[1] == 1 ) direction[1] = -1;
@@ -57,6 +72,12 @@ void moleculeMotionDisplay( Adafruit_BicolorMatrix &matrix, int8_t *position, in
 	position[0] += direction[0];
 	position[1] += direction[1];
 
+	matrix.drawPixel( position[0], position[1], colour );
+}
+
+
+void moleculeStaticDisplay( Adafruit_BicolorMatrix &matrix, int8_t *position, uint16_t colour )
+{
 	matrix.drawPixel( position[0], position[1], colour );
 }
 
@@ -90,32 +111,63 @@ void ftoa( char *str, float f, int precision )
 	free( decimalStr );
 }
 
+void pushValueToBuffer( float* buffer, float value, int count )
+{
+	int i;
+
+	// shift values
+	for ( i = 0; i < count; i++ ) buffer[ i ] = buffer[ i + 1 ];
+
+	buffer[ count - 1 ] = value;
+}
+
+float bufferAverage( float* buffer, int count )
+{
+	float sum = 0;
+	int i;
+
+	for ( i = 0; i < count; i++ ) sum += buffer[i];
+
+	return sum / (float)count;
+}
+
+
 
 void setup()
 {
+	int i;
+
 	Serial.begin( 9600 );
 
 	matrix1.begin( 0x70 );
 	matrix2.begin( 0x71 );
 
-	uvSensor.begin();
+	uvSensor.begin( 0x61 );
 
 	delay( 250 );
 
-	barometerSensor.begin();
-	humiditySensor.begin();
+	barometerSensor.begin(); // 0x60
+	humiditySensor.begin();  // 0x40
 
 //	TWBR = 12;
 
 	matrix1.setRotation( kMatrixRotation );
 	matrix2.setRotation( kMatrixRotation );
+
+	// initialise buffers
+	for( i = 0; i < COUNT( _temperatureBuffer ); i++ ) _temperatureBuffer[i] = 0;
+
+	// set up maximum sensor counter value
+	_sensorMaxCounter = pow( 2, 8 * sizeof( _sensorCounter ) );
 }
 
 
 void loop()
 {
-	uint8_t  period      = 0;
-	uint16_t colour      = LED_GREEN;
+	uint8_t  period = 0;
+	uint16_t colour = LED_GREEN;
+	float    averageTemperature,
+	         deltaValue;
 	char     output[2][256],
 	         tempStr[10],
 	         pressStr[10],
@@ -126,55 +178,74 @@ void loop()
 	         irStr[10],
 	         serialStr[245];
 
-	pressure    = periodCounter % kBarDisplayFrequency == 0 ? barometerSensor.getPressure()    : pressure,
-	temperature = periodCounter % kBarDisplayFrequency == 1 ? humiditySensor.readTemperature() : temperature,
-	humidity    = periodCounter % kBarDisplayFrequency == 2 ? humiditySensor.readHumidity()    : humidity;
-	light       = periodCounter % kBarDisplayFrequency == 3 ? uvSensor.readVisible()           : light;
-	uv          = periodCounter % kBarDisplayFrequency == 4 ? (float)uvSensor.readUV() / 100   : uv;
-	ir          = periodCounter % kBarDisplayFrequency == 5 ? uvSensor.readIR()                : ir;
+	_pressure    = _periodCounter % kBarDisplayFrequency == 0 ? barometerSensor.getPressure()    : _pressure,
+	_temperature = _periodCounter % kBarDisplayFrequency == 1 ? humiditySensor.readTemperature() : _temperature,
+	_humidity    = _periodCounter % kBarDisplayFrequency == 2 ? humiditySensor.readHumidity()    : _humidity;
+	_light       = _periodCounter % kBarDisplayFrequency == 3 ? uvSensor.readVisible()           : _light;
+	_uv          = _periodCounter % kBarDisplayFrequency == 4 ? (float)uvSensor.readUV() / 100   : _uv;
+	_ir          = _periodCounter % kBarDisplayFrequency == 5 ? uvSensor.readIR()                : _ir;
 	//altTemp     = barometerSensor.getTemperature();
 
-	if ( periodCounter % kBarDisplayFrequency == 0 )
+	// output sensor data to tty
+	if ( _periodCounter % kBarDisplayFrequency == 0 )
 	{
-		ftoa( tempStr, temperature, 4 );
-		ftoa( pressStr, pressure, 4 );
-		ftoa( humidityStr, humidity, 4 );
-		ftoa( lightStr, light, 4 );
-		ftoa( uvStr, uv, 4 );
-		ftoa( irStr, ir, 4 );
+		ftoa( tempStr, _temperature, 4 );
+		ftoa( pressStr, _pressure, 4 );
+		ftoa( humidityStr, _humidity, 4 );
+		ftoa( lightStr, _light, 4 );
+		ftoa( uvStr, _uv, 4 );
+		ftoa( irStr, _ir, 4 );
 		//ftoa( altTempStr, altTemp, 4 );
 
-		// output sensor data to tty
+		// output to tty
 		sprintf( serialStr, "%s,%s,%s,%s,%s,%s", tempStr, pressStr, humidityStr, lightStr, uvStr, irStr /*, altTempStr */ );
-		Serial.println( serialStr );
+//		Serial.println( serialStr );
 	}
-
-	// select colour for bars
-	if ( ( temperature < 22.0f && temperature >= 20.0f ) || ( temperature >= 25.0f && temperature < 27.0f ) ) colour = LED_YELLOW;
-	else if ( temperature >= 22.0f && temperature < 25.0f ) colour = LED_GREEN;
-	else colour = LED_RED;
 
 	// clear displays
 	matrix1.clear();
 	matrix2.clear();
 
 	// display temperature as bar visualisation on the first matrix
-	if ( periodCounter % 2 == 0 )
+//	if ( _periodCounter % 2 == 0 )
 	{
-		numberBarDisplay( matrix1, (int)( temperature / 10 ), 0, colour );
-		numberBarDisplay( matrix1, (int)( (int)temperature % 10 ), 1, colour );
-		numberBarDisplay( matrix1, (int)( ( temperature - (int)temperature ) * 10 ), 2, colour );
-		numberBarDisplay( matrix1, (int)( (int)( ( temperature - (int)temperature ) * 100 ) % 10 ), 3, colour );
+		// push temperature value to buffer
+		pushValueToBuffer( _temperatureBuffer, _temperature, COUNT( _temperatureBuffer ) );
+
+		// get average temperature
+		averageTemperature = bufferAverage( _temperatureBuffer, COUNT( _temperatureBuffer ) );
+
+		// select colour for bars
+		if ( ( averageTemperature < 22.0f && averageTemperature >= 20.0f ) || ( averageTemperature >= 24.0f && averageTemperature < 26.0f ) ) colour = LED_YELLOW;
+		else if ( averageTemperature >= 22.0f && averageTemperature < 24.0f ) colour = LED_GREEN;
+		else colour = LED_RED;
+
+		// output temperature bars to display
+		numberBarDisplay( matrix1, (int)( averageTemperature / 10 ), 0, colour );
+		numberBarDisplay( matrix1, (int)( (int)averageTemperature % 10 ), 1, colour );
+		numberBarDisplay( matrix1, (int)( ( averageTemperature - (int)averageTemperature ) * 10 ), 2, colour );
+		numberBarDisplay( matrix1, (int)( (int)( ( averageTemperature - (int)averageTemperature ) * 100 ) % 10 ), 3, colour );
 		matrix1.writeDisplay();
 	}
 
+	// calculate moduli
+	deltaValue = averageTemperature - kTemperatureLowerLimit;
+	if ( deltaValue < 0 ) deltaValue = 0;
+	else if ( deltaValue > kTemperatureRange ) deltaValue = kTemperatureRange;
+	_moleculeModuli[0] = (uint8_t)( 1 + kMoleculeMultiplier - kMoleculeMultiplier * log10( 1 + 9 * ( deltaValue / kTemperatureRange ) ) );
+
 	// display temperature molecule on the second matrix
-	moleculeMotionDisplay( matrix2, moleculePositions[0], moleculeDirections[0], LED_RED );
-	moleculeMotionDisplay( matrix2, moleculePositions[1], moleculeDirections[1], LED_YELLOW );
+	if ( _sensorCounter % _moleculeModuli[0] == 0 ) moleculeMotionDisplay( matrix2, _moleculePositions[0], _moleculeDirections[0], LED_RED );
+	else moleculeStaticDisplay( matrix2, _moleculePositions[0], LED_RED );
+	if ( _sensorCounter % _moleculeModuli[1] == 0 ) moleculeMotionDisplay( matrix2, _moleculePositions[1], _moleculeDirections[1], LED_YELLOW );
+	else moleculeStaticDisplay( matrix2, _moleculePositions[1], LED_YELLOW );
+	// if ( _sensorCounter % _moleculeModuli[2] == 0 ) moleculeMotionDisplay( matrix2, _moleculePositions[2], _moleculeDirections[2], LED_GREEN );
+	// else moleculeStaticDisplay( matrix2, _moleculePositions[2], LED_GREEN );
 	matrix2.writeDisplay();
 
 	// increment period counter
-	if ( ++periodCounter > kBarDisplayFrequency ) periodCounter = 0;
+	if ( ++_periodCounter > kBarDisplayFrequency ) _periodCounter = 0;
 
-	delay( kLoopInterval );
+	// reset sensor counter if it reaches maximum value
+	if ( ++_sensorCounter >= _sensorMaxCounter ) _sensorCounter = 0;
 }
