@@ -12,6 +12,8 @@
 #define kTemperatureUpperLimit    26.0f
 #define kTemperatureRange         ( kTemperatureUpperLimit - kTemperatureLowerLimit )
 #define kMoleculeMultiplier       100
+#define kMolecules                2
+#define kMoleculeSegments         1
 
 #define COUNT(b) (int)(sizeof(b) / sizeof(b[0]))
 
@@ -24,19 +26,20 @@ Adafruit_MPL115A2 barometerSensor;
 HTU21D humiditySensor;
 
 // VARIABLES
-float    _pressure                 = 0,
-         _temperature              = 0,
-         _humidity                 = 0,
-         _light                    = 0,
-         _uv                       = 0,
-         _ir                       = 0,
+float    _pressure                                                   = 0,
+         _temperature                                                = 0,
+         _humidity                                                   = 0,
+         _light                                                      = 0,
+         _uv                                                         = 0,
+         _ir                                                         = 0,
          _temperatureBuffer[100];
-uint8_t  _periodCounter            = 0;
-uint16_t _sensorCounter            = 0,
+uint8_t  _periodCounter                                              = 0;
+uint16_t _sensorCounter                                              = 0,
          _sensorMaxCounter;
-int8_t   _moleculePositions[3][2]  = { { 2, 2 }, { 6, 6 }, { 4, 4 } },
-         _moleculeDirections[3][2] = { { 1, 1 }, { -1, -1 }, { 1, -1 } },
-         _moleculeModuli[3]        = { kMoleculeMultiplier, kMoleculeMultiplier, kMoleculeMultiplier };
+int8_t   _moleculePositions[ kMolecules ][ kMoleculeSegments ][2],
+         _moleculeDirections[ kMolecules ][2],
+         _moleculeModuli[ kMolecules ];
+uint16_t _moleculeColours[3]                                         = { LED_RED, LED_GREEN, LED_YELLOW };
 
 
 void numberBarDisplay( Adafruit_BicolorMatrix &matrix, int numeral, int16_t offset, uint16_t colour )
@@ -49,10 +52,19 @@ void numberBarDisplay( Adafruit_BicolorMatrix &matrix, int numeral, int16_t offs
 }
 
 
-void moleculeMotionDisplay( Adafruit_BicolorMatrix &matrix, int8_t *position, int8_t *direction, uint16_t colour )
+void moleculeFreeMotionDisplay( Adafruit_BicolorMatrix &matrix, int8_t position[][2], int8_t direction[], uint16_t colour )
 {
+	int i;
 	long randoms[2] = { random( 0, 100 ), random( 0, 100 ) };
 
+	// copy positions down the tail
+	for ( i = kMoleculeSegments - 1; i > 0; i-- )
+	{
+		position[i][0] = position[ i - 1 ][0];
+		position[i][1] = position[ i - 1 ][1];
+	}
+
+	// determine new position
 	if ( randoms[0] > 87 && direction[0] != 0 ) direction[0] = 0;
 	else if ( randoms[0] > 75 ) direction[0] = -direction[0];
 	else if ( randoms[0] < 15 && direction[0] == 0 ) direction[0] = randoms[0] % 2 == 0 ? 1 : -1;
@@ -64,21 +76,99 @@ void moleculeMotionDisplay( Adafruit_BicolorMatrix &matrix, int8_t *position, in
 	if ( direction[0] == 0 && direction[1] == 0 ) direction[ randoms[0] % 2 ] = randoms[1] % 2 == 0 ? 1 : -1;
 
 	// check molecule isn't going off the edge
-	if ( position[0] >= 7 && direction[0] == 1 ) direction[0] = -1;
-	else if ( position[0] <= 0 && direction[0] == -1 ) direction[0] = 1;
-	if ( position[1] >= 7 && direction[1] == 1 ) direction[1] = -1;
-	else if ( position[1] <= 0 && direction[1] == -1 ) direction[1] = 1;
+	if ( position[0][0] >= 7 && direction[0] == 1 ) direction[0] = -1;
+	else if ( position[0][0] <= 0 && direction[0] == -1 ) direction[0] = 1;
+	if ( position[0][1] >= 7 && direction[1] == 1 ) direction[1] = -1;
+	else if ( position[0][1] <= 0 && direction[1] == -1 ) direction[1] = 1;
 
-	position[0] += direction[0];
-	position[1] += direction[1];
+	position[0][0] += direction[0];
+	position[0][1] += direction[1];
 
-	matrix.drawPixel( position[0], position[1], colour );
+	for ( i = 0; i < kMoleculeSegments; i++ ) matrix.drawPixel( position[i][0], position[i][1], colour );
 }
 
 
-void moleculeStaticDisplay( Adafruit_BicolorMatrix &matrix, int8_t *position, uint16_t colour )
+void moleculeLinearMotionDisplay( Adafruit_BicolorMatrix &matrix, int8_t position[][2], int8_t direction[], uint16_t colour )
 {
-	matrix.drawPixel( position[0], position[1], colour );
+	int i;
+	long randoms[2] = { random( 0, 100 ), random( 0, 100 ) };
+	int8_t previous[2];
+
+	// store previous directions
+	previous[0] = direction[0];
+	previous[1] = direction[1];
+
+	// copy positions down the tail
+	for ( i = kMoleculeSegments - 1; i > 0; i-- )
+	{
+		position[i][0] = position[ i - 1 ][0];
+		position[i][1] = position[ i - 1 ][1];
+	}
+
+	// determine new position
+	if ( randoms[0] > 50 && direction[0] != 0 ) direction[0] = 0;
+	if ( randoms[1] > 50 && direction[1] != 0 ) direction[1] = 0;
+
+	// ensure molecule is only moving in one direction at once
+	if ( direction[0] != 0 && direction[1] != 0 ) direction[ randoms[0] % 2 ] = 0;
+
+	// don't let molecules be still
+	if ( direction[0] == 0 && direction[1] == 0 )
+	{
+		if ( previous[ randoms[0] % 2 ] != 0 ) direction[ randoms[0] % 2 ] = previous[ randoms[0] % 2 ];
+		else direction[ randoms[0] % 2 ] = randoms[1] % 2 == 0 ? 1 : -1;
+	}
+
+	// check molecule isn't going off the edge
+	if ( ( position[0][0] >= 7 && direction[0] == 1 ) || ( position[0][0] <= 0 && direction[0] == -1 ) )
+	{
+		direction[0] = 0;
+
+		switch ( position[0][1] )
+		{
+			case 0:
+				direction[1] = 1;
+				break;
+
+			case 7:
+				direction[1] = -1;
+				break;
+
+			default:
+				direction[1] = randoms[1] % 2 == 0 ? 1 : -1;
+		}
+	}
+	if ( ( position[0][1] >= 7 && direction[1] == 1 ) || ( position[0][1] <= 0 && direction[1] == -1 ) )
+	{
+		direction[1] = 0;
+
+		switch ( position[0][0] )
+		{
+			case 0:
+				direction[0] = 1;
+				break;
+
+			case 7:
+				direction[0] = -1;
+				break;
+
+			default:
+				direction[0] = randoms[1] % 2 == 0 ? 1 : -1;
+		}
+	}
+
+	position[0][0] += direction[0];
+	position[0][1] += direction[1];
+
+	for ( i = 0; i < kMoleculeSegments; i++ ) matrix.drawPixel( position[i][0], position[i][1], colour );
+}
+
+
+void moleculeStaticDisplay( Adafruit_BicolorMatrix &matrix, int8_t position[][2], uint16_t colour )
+{
+	int i;
+
+	for ( i = 0; i < kMoleculeSegments; i++ ) matrix.drawPixel( position[i][0], position[i][1], colour );
 }
 
 
@@ -135,7 +225,7 @@ float bufferAverage( float* buffer, int count )
 
 void setup()
 {
-	int i;
+	int i, j;
 
 	Serial.begin( 9600 );
 
@@ -159,12 +249,29 @@ void setup()
 
 	// set up maximum sensor counter value
 	_sensorMaxCounter = pow( 2, 8 * sizeof( _sensorCounter ) );
+
+	// initialise molecules
+	for ( i = 0; i < kMolecules; i++ )
+	{
+		// initialise positions
+		for ( j = 0; j < kMoleculeSegments; j++ )
+		{
+			_moleculePositions[ i ][ j ][0] = _moleculePositions[ i ][ j ][1] = 4;
+		}
+
+		// initialise directions
+		_moleculeDirections[i][0] = 0;
+		_moleculeDirections[i][1] = 1;
+
+		// initialise moduli
+		_moleculeModuli[i] = kMoleculeMultiplier;
+	}
 }
 
 
 void loop()
 {
-	uint8_t  period = 0;
+	uint8_t  i;
 	uint16_t colour = LED_GREEN;
 	float    averageTemperature,
 	         deltaValue;
@@ -177,6 +284,7 @@ void loop()
 	         uvStr[10],
 	         irStr[10],
 	         serialStr[245];
+
 
 	_pressure    = _periodCounter % kBarDisplayFrequency == 0 ? barometerSensor.getPressure()    : _pressure,
 	_temperature = _periodCounter % kBarDisplayFrequency == 1 ? humiditySensor.readTemperature() : _temperature,
@@ -234,13 +342,16 @@ void loop()
 	else if ( deltaValue > kTemperatureRange ) deltaValue = kTemperatureRange;
 	_moleculeModuli[0] = (uint8_t)( 1 + kMoleculeMultiplier - kMoleculeMultiplier * log10( 1 + 9 * ( deltaValue / kTemperatureRange ) ) );
 
-	// display temperature molecule on the second matrix
-	if ( _sensorCounter % _moleculeModuli[0] == 0 ) moleculeMotionDisplay( matrix2, _moleculePositions[0], _moleculeDirections[0], LED_RED );
-	else moleculeStaticDisplay( matrix2, _moleculePositions[0], LED_RED );
-	if ( _sensorCounter % _moleculeModuli[1] == 0 ) moleculeMotionDisplay( matrix2, _moleculePositions[1], _moleculeDirections[1], LED_YELLOW );
-	else moleculeStaticDisplay( matrix2, _moleculePositions[1], LED_YELLOW );
-	// if ( _sensorCounter % _moleculeModuli[2] == 0 ) moleculeMotionDisplay( matrix2, _moleculePositions[2], _moleculeDirections[2], LED_GREEN );
-	// else moleculeStaticDisplay( matrix2, _moleculePositions[2], LED_GREEN );
+	// display molecules on display 2
+	for ( i = 0; i < kMolecules; i++ )
+	{
+		if ( _sensorCounter % _moleculeModuli[i] == 0 )
+		{
+			if ( kMoleculeSegments > 1 ) moleculeLinearMotionDisplay( matrix2, _moleculePositions[i], _moleculeDirections[i], _moleculeColours[ i % kMolecules ] );
+			else moleculeFreeMotionDisplay( matrix2, _moleculePositions[i], _moleculeDirections[i], _moleculeColours[ i % kMolecules ] );
+		}
+		else moleculeStaticDisplay( matrix2, _moleculePositions[i], _moleculeColours[ i % kMolecules ] );
+	}
 	matrix2.writeDisplay();
 
 	// increment period counter
